@@ -130,36 +130,44 @@ impl ASHA {
             scan:    false
         };
     }
-    pub async fn start_scan(self){
+    pub async fn start_scan(mut self){
         println!("Started scan");
-        // let mut filter = DiscoveryFilter{
-        //     transport: bluer::DiscoveryTransport::Le,
-        //     uuids: [ASHA_UUID].try_into().unwrap(),
-        //     ..Default::default()
-        // };
-        // self.adapter.set_discovery_filter(filter).await.expect("Could not set filter");
+        let mut filter = DiscoveryFilter{
+            transport: bluer::DiscoveryTransport::Le,
+            uuids: [ASHA_UUID].try_into().unwrap(),
+            ..Default::default()
+        };
+        self.adapter.set_discovery_filter(filter).await.expect("Could not set filter");
         let discoverer = match self.adapter.discover_devices_with_changes().await {
             Ok(res) => res,
             Err(_) => panic!("Discoverer could not start!")
         };
         pin_mut!(discoverer);
 
+        self.scan = true;
+
         while self.scan {
-            match discoverer.next().await {
-                Some(event) => 
+            tokio::select! {
+                Some(event) = discoverer.next() => {
                     match event {
-                        AdapterEvent::DeviceAdded(addr) => ASHA::print_properties(self.adapter.device(addr).unwrap()),
-                        AdapterEvent::DeviceRemoved(_)  => panic!(),
-                        AdapterEvent::PropertyChanged(_) => panic!()
+                        AdapterEvent::DeviceAdded(addr) => {
+                            let dev = self.adapter.device(addr).unwrap();
+                            match dev.rssi().await.unwrap() {
+                                Some(rssi) => {
+                                    println!("Found {} with an RSSI of {}", dev.name().await.unwrap().unwrap(), rssi);
+                                }
+                                _ => ()
+                            }
+                        },
+                        AdapterEvent::DeviceRemoved(_) | AdapterEvent::PropertyChanged(_) => {
+                            println!("Something happened!")
+                        }
                     }
-                _ => panic!()
-            }.await;
+                }
+            };
         }
     }
     pub fn stop_scan(mut self){
         self.scan = false;
-    }
-    pub async fn print_properties(dev: bluer::Device){
-        println!("{}", dev.name().await.unwrap().expect("lol"));
     }
 }

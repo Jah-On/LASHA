@@ -6,6 +6,6 @@ async fn main() {
 
     let mut test = ASHA::ASHA::new().await;
 
-    test.start_scan().await;
+    test.start_scan(1).await;
     // tokio::time::sleep(Duration::from_secs(10000)).await;
 }

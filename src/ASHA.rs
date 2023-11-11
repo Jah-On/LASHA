@@ -1,4 +1,4 @@
-use std::{str::FromStr, collections::{HashSet, hash_map::RandomState}};
+use std::{str::FromStr, collections::{HashSet, hash_map::RandomState, HashMap}, error::{Error, self}, default};
 use futures::{pin_mut, stream::SelectAll, StreamExt};
 use bluer::{monitor::{Pattern, data_type}, Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device};
 use uuid::{uuid, Uuid};
@@ -12,17 +12,22 @@ pub const ASTC_UUID: uuid::Uuid = uuid!("38663f1a-e711-4cac-b641-326b56404837");
 pub const VOLC_UUID: uuid::Uuid = uuid!("00e4ca9e-ab14-41e4-8823-f9e70c7e91df"); // Volume                characteristic
 pub const PSMC_UUID: uuid::Uuid = uuid!("2d410339-82b6-42aa-b34e-e2e01df8cc1a"); // LE Pulse Module Sense characteristic
 
+
+#[derive(Clone, Debug)]
 pub enum SIDE {
     LEFT,
     RIGHT
 }
 
+
+#[derive(Clone, Debug)]
 pub enum MODALITY {
     MONAURAL,
     BINAURAL
 }
 
-struct DeviceCapabilities {
+#[derive(Clone, Debug)]
+pub struct DeviceCapabilities {
     side:     SIDE,
     modality: MODALITY,
     csis:     bool
@@ -53,6 +58,7 @@ impl DeviceCapabilities {
     }
 }
 
+#[derive(Clone)]
 struct HiSyncID {
     manufacturer: bluer::id::Manufacturer,
     set:          uuid::Uuid
@@ -71,6 +77,7 @@ impl HiSyncID {
     }
 }
 
+#[derive(Clone)]
 struct FeatureMap {
     coc: bool
 }
@@ -83,6 +90,7 @@ impl FeatureMap {
     }
 }
 
+#[derive(Clone)]
 struct ReadOnlyProperties {
     version:            u8,
     deviceCapabilities: DeviceCapabilities,
@@ -107,11 +115,20 @@ impl ReadOnlyProperties {
     }
 }
 
+#[derive(Clone)]
 struct AudioProcessor {
     readOnlyProperties: ReadOnlyProperties,
     audioStatusPoint:   u8
 }
 
+#[derive(Clone)]
+pub struct DiscoveredProcessor {
+    addr: bluer::Address,
+    name: String,
+    dc:   DeviceCapabilities
+}
+
+#[derive(Clone)]
 pub enum AdapterState {
     Okay,
     NoAdapter,
@@ -119,10 +136,17 @@ pub enum AdapterState {
     BluetoothOff
 }
 
+impl Default for AdapterState {
+    fn default() -> Self { AdapterState::NoAdapter }
+}
+
+#[derive(Default, Clone)]
 pub struct ASHA {
-    state:        AdapterState,
-    session:      Session,
-    adapter:      Adapter,
+    pub state:    AdapterState,
+    adapter:      Option<Adapter>,
+    right:        Option<AudioProcessor>,
+    left:         Option<AudioProcessor>,
+    discovered:   HashMap<Address, DiscoveredProcessor>,
     scan:         bool
 }
 
@@ -137,43 +161,70 @@ impl ASHA {
             Err(_) => return AdapterState::NoAdapter
         };
         return match temp_adapter.is_powered().await {
-            Ok(_)  => AdapterState::Okay,
-            Err(_) => AdapterState::BluetoothOff
+            Ok(res)  => {
+                match res {
+                    true => AdapterState::Okay,
+                    _    => AdapterState::BluetoothOff
+                }
+            },
+            Err(_) => AdapterState::NoAdapter
         };
     }
     pub async fn new() -> ASHA {
         let temp_state = Self::get_adapter_state().await;
         match temp_state {
-            AdapterState::NoAdapter           => panic!("Check state before making struct!"),
-            AdapterState::InadequateBtVersion => panic!("Check state before making struct!"),
+            AdapterState::NoAdapter | AdapterState::InadequateBtVersion => {
+                return ASHA{
+                    state:      AdapterState::NoAdapter,
+                    adapter:    None,
+                    right:      None,
+                    left:       None,
+                    discovered: HashMap::new(),
+                    scan:       false
+                };
+            },
             _                                 => ()
         }
         let temp_ses: Session = match Session::new().await {
             Ok(res) => res,
-            Err(_)           => panic!("BlueZ turned off during creation!")
+            Err(_)           => panic!("BlueZ stopped?")
         };
         return ASHA {
-            session: temp_ses.to_owned(),
+            state:   temp_state,
             adapter: match temp_ses.default_adapter().await {
-                Ok(res) => res,
+                Ok(res) => Some(res),
                 Err(_)           => panic!("Adapter disconnected during creation?")
             },
-            state:   temp_state,
-            scan:    false
+            right:      None,
+            left:       None,
+            discovered: HashMap::new(),
+            scan:       false
         };
     }
-    pub async fn start_scan(mut self, count: u8){
+    pub fn get_discovered(self) -> HashMap<Address, DiscoveredProcessor> {
+        return self.discovered;
+    }
+    pub async fn start_scan(mut self, _count: u8){
         println!("Started scan");
-        let mut filter = DiscoveryFilter{
+        let filter = DiscoveryFilter{
             transport: bluer::DiscoveryTransport::Le,
-            rssi: Some(-90),
+            rssi: Some(-80),
             ..Default::default()
         };
-        // filter.uuids.insert(ASHA_UUID);
-        self.adapter.set_discovery_filter(filter).await.expect("Could not set filter");
-        let discoverer = match self.adapter.discover_devices_with_changes().await {
+        let adapter = match self.adapter {
+            Some(adapter) => adapter,
+            None                   => {
+                self.scan = false;
+                return;
+            }
+        };
+        adapter.set_discovery_filter(filter).await.expect("Could not set filter");
+        let discoverer = match adapter.discover_devices_with_changes().await {
             Ok(res) => res,
-            Err(_) => panic!("Discoverer could not start!")
+            Err(_) => {
+                self.scan = false;
+                return;
+            }
         };
         pin_mut!(discoverer);
 
@@ -184,21 +235,53 @@ impl ASHA {
             Some(event) = discoverer.next() => {
                 match event {
                     AdapterEvent::DeviceAdded(addr) => {
-                        let dev = self.adapter.device(addr).unwrap();
-                        match dev.service_data().await.unwrap() {
-                            Some(data) => {
-                                match data.get(&ASHA_UUID.clone()) {
-                                    Some(_) => { 
-                                        ASHA::query_properties(dev).await;
-                                    },
-                                    _       => {}
-                                }
-                                // println!("Name is {}", serv_data.);
-                            }
-                            _ => {}
+                        match self.discovered.contains_key(&addr) {
+                            true => continue,
+                            _    => ()
                         }
+                        let dev = match adapter.device(addr) {
+                            Ok(res) => res,
+                            Err(_)  => continue
+                        };
+                        match dev.rssi().await {
+                            Ok(rssi) => {
+                                match rssi {
+                                    Some(_) => {},
+                                    None    => continue
+                                }
+                            },
+                            Err(_)   => continue
+                        }
+                        let name = match dev.name().await {
+                            Ok(res) => match res {
+                                Some(name) => name,
+                                None       => continue
+                            },
+                            Err(_)  => continue
+                        };
+                        let data = match dev.service_data().await {
+                            Ok(res) => match res {
+                                Some(services) => match services.get(&ASHA_UUID) {
+                                    Some(matching) => matching[1],
+                                    None           => continue
+                                },
+                                None           => continue
+                            }
+                            Err(_) => continue 
+                        };
+                        let dc = DeviceCapabilities::new(data);
+                        self.discovered.insert(
+                            addr,
+                            DiscoveredProcessor { 
+                                addr: dev.address(), 
+                                name: name, 
+                                dc: dc 
+                            }
+                        );
                     },
-                    AdapterEvent::DeviceRemoved(_) | 
+                    AdapterEvent::DeviceRemoved(addr) => {
+                        self.discovered.remove(&addr);
+                    } 
                     AdapterEvent::PropertyChanged(_) => {
                     }
                 }
@@ -206,34 +289,24 @@ impl ASHA {
             };
         }
     }
-    async fn query_properties(dev: bluer::Device) -> ReadOnlyProperties {
-        loop {
-            tokio::select! {
-                Ok(serv) = dev.service(ASHA_UUID.as_fields().1) => {
-                    loop {
-                        tokio::select! {
-                            Ok(crt) = serv.characteristic(ROPC_UUID.as_fields().1) => {
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                                let data      = match crt.read().await {
-                                    Ok(res)  => res,
-                                    _        => continue
-                                };
-                                let rop       = ReadOnlyProperties::new(data.try_into().unwrap());
-            
-                                match rop.deviceCapabilities.side {
-                                    SIDE::RIGHT => {println!("Right side!")}
-                                    SIDE::LEFT  => {println!("Left side!")}
-                                }
-            
-                                return rop;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
     pub fn stop_scan(mut self){
         self.scan = false;
+    }
+    pub async fn update_state(mut self){
+        match self.state {
+            AdapterState::Okay => return,
+            _                  => {}
+        }
+        match self.adapter {
+            Some(adapter) => {
+                match adapter.is_powered().await.unwrap() {
+                    true => self.state = AdapterState::Okay,
+                    _    => self.state = AdapterState::BluetoothOff
+                }
+            }
+            None                   => {
+                self.state = ASHA::get_adapter_state().await;
+            }
+        }
     }
 }

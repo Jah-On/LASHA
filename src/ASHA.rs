@@ -1,6 +1,7 @@
-use std::{str::FromStr, collections::{HashSet, hash_map::RandomState, HashMap}, error::{Error, self}, default};
-use futures::{pin_mut, stream::SelectAll, StreamExt};
-use bluer::{monitor::{Pattern, data_type}, Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device};
+use std::{str::FromStr, collections::{HashSet, hash_map::RandomState, HashMap}, error::{Error, self}, default, time::Duration};
+use futures::{pin_mut, stream::SelectAll, StreamExt, select, Stream, TryFutureExt};
+use bluer::{monitor::{Pattern, data_type}, Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device, gatt::remote::{Service, CharacteristicReadRequest}, UuidExt};
+use tokio::time::sleep;
 use uuid::{uuid, Uuid};
 
 const test_uuid: uuid::Uuid = uuid!("00030000-78fc-48fe-8e23-433b3a1942d0");
@@ -12,6 +13,12 @@ pub const ASTC_UUID: uuid::Uuid = uuid!("38663f1a-e711-4cac-b641-326b56404837");
 pub const VOLC_UUID: uuid::Uuid = uuid!("00e4ca9e-ab14-41e4-8823-f9e70c7e91df"); // Volume                characteristic
 pub const PSMC_UUID: uuid::Uuid = uuid!("2d410339-82b6-42aa-b34e-e2e01df8cc1a"); // LE Pulse Module Sense characteristic
 
+const ASHA_ID: u16 = 117;
+const ROPC_ID: u16 = 118;
+const ACPC_ID: u16 = 120;
+const ASTC_ID: u16 = 122;
+const VOLC_ID: u16 = 125;
+const PSMC_ID: u16 = 127;
 
 #[derive(Clone, Debug)]
 pub enum SIDE {
@@ -24,6 +31,14 @@ pub enum SIDE {
 pub enum MODALITY {
     MONAURAL,
     BINAURAL
+}
+
+#[derive(Clone, Debug)]
+pub enum DevicesConnected {
+    NONE,
+    LEFT,
+    RIGHT,
+    BOTH
 }
 
 #[derive(Clone, Debug)]
@@ -58,26 +73,26 @@ impl DeviceCapabilities {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct HiSyncID {
     manufacturer: bluer::id::Manufacturer,
-    set:          uuid::Uuid
+    set:          u64
 }
 
 impl HiSyncID {
     pub fn new(data: [u8; 8]) -> HiSyncID {
         return HiSyncID{
             manufacturer: bluer::id::Manufacturer::try_from(
-                ((data[0] as u8 as u16) << 8) | (data[1] as u16)
+                u16::from_le_bytes(data[0..2].try_into().unwrap())
             ).unwrap(),
-            set:          uuid::Builder::from_slice(
-                &data[2..7]
-            ).unwrap().into_uuid()
+            set:          u64::from_be_bytes(
+                data[0..8].try_into().unwrap()
+            ) & 0x00FFFFFF
         };
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct FeatureMap {
     coc: bool
 }
@@ -90,7 +105,7 @@ impl FeatureMap {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct ReadOnlyProperties {
     version:            u8,
     deviceCapabilities: DeviceCapabilities,
@@ -106,19 +121,24 @@ impl ReadOnlyProperties {
         return ReadOnlyProperties{
             version:            data[0],
             deviceCapabilities: DeviceCapabilities::new(data[1]),
-            hiSyncId:           HiSyncID::new(data[2..9].try_into().unwrap()),
+            hiSyncId:           HiSyncID::new(data[2..10].try_into().unwrap()),
             featureMap:         FeatureMap::new(data[10]),
-            renderDelay:        ((data[11] as u8 as u16) << 8) | (data[12] as u16),
-            reserved:           data[13..14].try_into().unwrap(),
-            supportedCodecs:    ((data[15] as u8 as u16) << 8) | (data[16] as u16),
+            renderDelay:        u16::from_le_bytes(
+                data[11..13].try_into().unwrap()
+            ),
+            reserved:           data[13..15].try_into().unwrap(),
+            supportedCodecs:    u16::from_le_bytes(
+                data[15..17].try_into().unwrap()
+            ),
         };
     }
 }
 
 #[derive(Clone)]
 struct AudioProcessor {
-    readOnlyProperties: ReadOnlyProperties,
-    audioStatusPoint:   u8
+    device_handle:        Device,
+    read_only_properties: ReadOnlyProperties,
+    audio_status_point:   u8
 }
 
 #[derive(Clone)]
@@ -128,7 +148,7 @@ pub struct DiscoveredProcessor {
     dc:   DeviceCapabilities
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub enum AdapterState {
     Okay,
     NoAdapter,
@@ -140,14 +160,17 @@ impl Default for AdapterState {
     fn default() -> Self { AdapterState::NoAdapter }
 }
 
+impl Default for DevicesConnected {
+    fn default() -> Self { DevicesConnected::NONE }
+}
+
 #[derive(Default, Clone)]
 pub struct ASHA {
-    pub state:    AdapterState,
-    adapter:      Option<Adapter>,
-    right:        Option<AudioProcessor>,
-    left:         Option<AudioProcessor>,
-    discovered:   HashMap<Address, DiscoveredProcessor>,
-    scan:         bool
+    state:           AdapterState,
+    adapter:         Option<Adapter>,
+    right:           Option<AudioProcessor>,
+    left:            Option<AudioProcessor>,
+    peers_connected: DevicesConnected
 }
 
 impl ASHA {
@@ -175,12 +198,11 @@ impl ASHA {
         match temp_state {
             AdapterState::NoAdapter | AdapterState::InadequateBtVersion => {
                 return ASHA{
-                    state:      AdapterState::NoAdapter,
-                    adapter:    None,
-                    right:      None,
-                    left:       None,
-                    discovered: HashMap::new(),
-                    scan:       false
+                    state:         temp_state,
+                    adapter:       None,
+                    right:         None,
+                    left:          None,
+                    ..Default::default()
                 };
             },
             _                                 => ()
@@ -195,118 +217,105 @@ impl ASHA {
                 Ok(res) => Some(res),
                 Err(_)           => panic!("Adapter disconnected during creation?")
             },
-            right:      None,
-            left:       None,
-            discovered: HashMap::new(),
-            scan:       false
-        };
-    }
-    pub fn get_discovered(self) -> HashMap<Address, DiscoveredProcessor> {
-        return self.discovered;
-    }
-    pub async fn start_scan(mut self, _count: u8){
-        println!("Started scan");
-        let filter = DiscoveryFilter{
-            transport: bluer::DiscoveryTransport::Le,
-            rssi: Some(-80),
+            right:         None,
+            left:          None,
             ..Default::default()
         };
-        let adapter = match self.adapter {
+    }
+    pub async fn get_state(& mut self) -> AdapterState {
+        return self.state.to_owned();
+    }
+    pub async fn get_devices_connected(& mut self) -> DevicesConnected {
+        return self.peers_connected.to_owned();
+    }
+    pub async fn update_state(&mut self){
+        self.state = ASHA::get_adapter_state().await;
+    }
+    pub async fn update_devices(&mut self){
+        match self.peers_connected {
+            DevicesConnected::RIGHT | 
+            DevicesConnected::LEFT => self.update_from_one_connected().await,
+            DevicesConnected::BOTH => self.update_from_two_connected().await,
+            _ => self.update_from_paired().await
+        }
+    }
+    async fn update_from_paired(&mut self){
+        let adapter = match &self.adapter {
             Some(adapter) => adapter,
-            None                   => {
-                self.scan = false;
-                return;
-            }
+            None => return
         };
-        adapter.set_discovery_filter(filter).await.expect("Could not set filter");
-        let discoverer = match adapter.discover_devices_with_changes().await {
-            Ok(res) => res,
-            Err(_) => {
-                self.scan = false;
-                return;
-            }
+        let disocvery_filter = DiscoveryFilter{
+            transport: bluer::DiscoveryTransport::Le,
+            ..Default::default()
         };
-        pin_mut!(discoverer);
-
-        self.scan = true;
-
-        while self.scan {
-            tokio::select! {
-            Some(event) = discoverer.next() => {
-                match event {
-                    AdapterEvent::DeviceAdded(addr) => {
-                        match self.discovered.contains_key(&addr) {
-                            true => continue,
-                            _    => ()
-                        }
-                        let dev = match adapter.device(addr) {
-                            Ok(res) => res,
-                            Err(_)  => continue
-                        };
-                        match dev.rssi().await {
-                            Ok(rssi) => {
-                                match rssi {
-                                    Some(_) => {},
-                                    None    => continue
-                                }
-                            },
-                            Err(_)   => continue
-                        }
-                        let name = match dev.name().await {
-                            Ok(res) => match res {
-                                Some(name) => name,
-                                None       => continue
-                            },
-                            Err(_)  => continue
-                        };
-                        let data = match dev.service_data().await {
-                            Ok(res) => match res {
-                                Some(services) => match services.get(&ASHA_UUID) {
-                                    Some(matching) => matching[1],
-                                    None           => continue
-                                },
-                                None           => continue
-                            }
-                            Err(_) => continue 
-                        };
-                        let dc = DeviceCapabilities::new(data);
-                        self.discovered.insert(
-                            addr,
-                            DiscoveredProcessor { 
-                                addr: dev.address(), 
-                                name: name, 
-                                dc: dc 
-                            }
-                        );
-                    },
-                    AdapterEvent::DeviceRemoved(addr) => {
-                        self.discovered.remove(&addr);
-                    } 
-                    AdapterEvent::PropertyChanged(_) => {
-                    }
-                }
-            }
+        adapter.set_discovery_filter(disocvery_filter).await.expect("Filter counld not be set!");
+        loop {
+            let event = match match adapter.discover_devices().await {
+                Ok(mut res) => res.next().await,
+                Err(_)      => return
+            } {
+                Some(event) => event,
+                None        => break
             };
-        }
-    }
-    pub fn stop_scan(mut self){
-        self.scan = false;
-    }
-    pub async fn update_state(mut self){
-        match self.state {
-            AdapterState::Okay => return,
-            _                  => {}
-        }
-        match self.adapter {
-            Some(adapter) => {
-                match adapter.is_powered().await.unwrap() {
-                    true => self.state = AdapterState::Okay,
-                    _    => self.state = AdapterState::BluetoothOff
+            let addr = match event {
+                AdapterEvent::DeviceAdded(addr) => addr,
+                _                               => continue
+            };
+            let device = match adapter.device(addr) {
+                Ok(device) => device,
+                Err(_)     => continue
+            };
+            match device.is_paired().await {
+                Ok(res) => match res {
+                    true  => (),
+                    false => continue
                 }
+                Err(_) => continue
             }
-            None                   => {
-                self.state = ASHA::get_adapter_state().await;
+            match device.is_connected().await {
+                Ok(res) => match res {
+                    true  => (),
+                    false => continue
+                }
+                Err(_) => continue
             }
+
+            match match match device.uuids().await {
+                Ok(res) => res,
+                Err(_)  => {
+                    continue;
+                }
+            } {
+                Some(res) => res,
+                None    => {
+                    continue;
+                }
+            }.contains(&ASHA_UUID) {
+                true  => (),
+                false => continue
+            };
+
+            let service = match device.service(ASHA_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let characteristic = match service.characteristic(ROPC_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let data = match characteristic.read().await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let rop = ReadOnlyProperties::new(
+                data.try_into().unwrap()
+            );
+
+            println!("{:?}", rop);
         }
+    }
+    async fn update_from_one_connected(&mut self){
+    }
+    async fn update_from_two_connected(&mut self){
     }
 }

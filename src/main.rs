@@ -5,17 +5,9 @@ use tokio::time::sleep;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // let host = cpal::default_host();
+    let host = cpal::default_host();
 
-    // let dev = host.default_output_device().unwrap();
-
-    // let confy = StreamConfig{
-    //     sample_rate: SampleRate{
-    //         0: 16000
-    //     },
-    //     channels:    1,
-    //     buffer_size: cpal::BufferSize::Fixed(320)
-    // };
+    let dev = host.default_output_device().unwrap();
 
     let mut test = ASHA::ASHA::new().await;
 
@@ -27,7 +19,7 @@ async fn main() {
                 break;
             },
             ASHA::AdapterState::BluetoothOff        => {
-                sleep(Duration::from_millis(10)).await;
+                sleep(Duration::from_millis(100)).await;
                 test.update_state().await;
                 continue;
             }

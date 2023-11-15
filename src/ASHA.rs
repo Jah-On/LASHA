@@ -153,7 +153,7 @@ pub enum AdapterState {
     Okay,
     NoAdapter,
     InadequateBtVersion,
-    BluetoothOff
+    BluetoothOff,
 }
 
 impl Default for AdapterState {
@@ -170,7 +170,8 @@ pub struct ASHA {
     adapter:         Option<Adapter>,
     right:           Option<AudioProcessor>,
     left:            Option<AudioProcessor>,
-    peers_connected: DevicesConnected
+    peers_connected: DevicesConnected,
+    addresses:       Vec<Address>
 }
 
 impl ASHA {
@@ -244,34 +245,18 @@ impl ASHA {
             Some(adapter) => adapter,
             None => return
         };
-        let disocvery_filter = DiscoveryFilter{
-            transport: bluer::DiscoveryTransport::Le,
-            ..Default::default()
+        let addresses = match adapter.device_addresses().await {
+            Ok(res) => res,
+            Err(_)      => return
         };
-        adapter.set_discovery_filter(disocvery_filter).await.expect("Filter counld not be set!");
-        loop {
-            let event = match match adapter.discover_devices().await {
-                Ok(mut res) => res.next().await,
-                Err(_)      => return
-            } {
-                Some(event) => event,
-                None        => break
-            };
-            let addr = match event {
-                AdapterEvent::DeviceAdded(addr) => addr,
-                _                               => continue
-            };
-            let device = match adapter.device(addr) {
+        for address in addresses {
+            if self.addresses.contains(&address){
+                continue;
+            }
+            let device = match adapter.device(address) {
                 Ok(device) => device,
                 Err(_)     => continue
             };
-            match device.is_paired().await {
-                Ok(res) => match res {
-                    true  => (),
-                    false => continue
-                }
-                Err(_) => continue
-            }
             match device.is_connected().await {
                 Ok(res) => match res {
                     true  => (),
@@ -279,7 +264,6 @@ impl ASHA {
                 }
                 Err(_) => continue
             }
-
             match match match device.uuids().await {
                 Ok(res) => res,
                 Err(_)  => {
@@ -311,7 +295,31 @@ impl ASHA {
                 data.try_into().unwrap()
             );
 
-            println!("{:?}", rop);
+            let processor = AudioProcessor{
+                device_handle:        device,
+                read_only_properties: rop,
+                audio_status_point:   0
+            };
+
+            self.addresses.push(address);
+            let side = processor.read_only_properties.deviceCapabilities.side.clone();
+            match side {
+                SIDE::RIGHT => self.right = Some(processor),
+                SIDE::LEFT =>  self.left  = Some(processor)
+            }
+            match self.peers_connected {
+                DevicesConnected::RIGHT |
+                DevicesConnected::LEFT    => {
+                    self.peers_connected = DevicesConnected::BOTH;
+                    return;
+                }
+                DevicesConnected::NONE    => (),
+                _ => panic!("Should not add new when both are set!")
+            }
+            match side {
+                SIDE::RIGHT => self.peers_connected = DevicesConnected::RIGHT,
+                SIDE::LEFT  => self.peers_connected = DevicesConnected::LEFT
+            }
         }
     }
     async fn update_from_one_connected(&mut self){

@@ -141,71 +141,72 @@ impl ReadOnlyProperties {
     }
 }
 
-#[derive(Clone)]
+// #[derive(Clone)]
 struct AudioProcessor {
     device_handle:        Device,
     read_only_properties: ReadOnlyProperties,
-    psm:                  u16,
     audio_status_point:   u8,
-    l2cap:                Socket<SeqPacket>,
-    seqStream:            Vec<SeqPacket>
+    socket:               SeqPacket
 }
 
-#[derive(Clone)]
-pub struct DiscoveredProcessor {
-    addr: bluer::Address,
-    name: String,
-    dc:   DeviceCapabilities
-}
+// For possible feature implementation 
+// #[derive(Clone)]
+// pub struct DiscoveredProcessor {
+//     addr: bluer::Address,
+//     name: String,
+//     dc:   DeviceCapabilities
+// }
 
-#[derive(Clone, Debug)]
-pub enum AdapterState {
-    Okay,
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum State {
+    Idle,
     NoAdapter,
     InadequateBtVersion,
     BluetoothOff,
+    Streaming
 }
 
-impl Default for AdapterState {
-    fn default() -> Self { AdapterState::NoAdapter }
+impl Default for State {
+    fn default() -> Self { State::NoAdapter }
 }
 
 impl Default for DevicesConnected {
     fn default() -> Self { DevicesConnected::NONE }
 }
 
-#[derive(Default, Clone)]
+#[derive(Default)]
 pub struct ASHA {
-    state:           AdapterState,
+    state:           State,
     adapter:         Option<Adapter>,
     peers_connected: HashMap<DevicesConnected, AudioProcessor>,
     addresses:       Vec<Address>
 }
 
 impl ASHA {
-    pub async fn get_adapter_state() -> AdapterState {
+    pub async fn get_adapter_state() -> State {
         let temp_ses = match Session::new().await {
             Ok(res) => res,
-            Err(_) => return AdapterState::NoAdapter
+            Err(_) => return State::NoAdapter
         };
         let temp_adapter = match temp_ses.default_adapter().await {
             Ok(res) => res,
-            Err(_) => return AdapterState::NoAdapter
+            Err(_) => return State::NoAdapter
         };
         return match temp_adapter.is_powered().await {
             Ok(res)  => {
                 match res {
-                    true => AdapterState::Okay,
-                    _    => AdapterState::BluetoothOff
+                    true => State::Idle,
+                    _    => State::BluetoothOff
                 }
             },
-            Err(_) => AdapterState::NoAdapter
+            Err(_) => State::NoAdapter
         };
     }
+    
     pub async fn new() -> ASHA {
         let temp_state = Self::get_adapter_state().await;
         match temp_state {
-            AdapterState::NoAdapter | AdapterState::InadequateBtVersion => {
+            State::NoAdapter | State::InadequateBtVersion => {
                 return ASHA{
                     state:         temp_state,
                     adapter:       None,
@@ -227,18 +228,25 @@ impl ASHA {
             ..Default::default()
         };
     }
-    pub async fn get_state(& mut self) -> AdapterState {
+    
+    pub async fn get_state(& mut self) -> State {
         return self.state.to_owned();
     }
+    
     pub async fn get_devices_connected(& mut self) -> DevicesConnected {
         match self.peers_connected.keys().last() {
             Some(res) => res.to_owned(),
             None      => DevicesConnected::NONE
         }
     }
+    
     pub async fn update_state(&mut self){
-        self.state = ASHA::get_adapter_state().await;
+        match self.state {
+            State::Streaming => (),
+            _                => self.state = ASHA::get_adapter_state().await
+        }
     }
+    
     pub async fn update_devices(&mut self){
         // May be updated to allow new devices during stream
         // but omitting for now for simplicity
@@ -249,6 +257,7 @@ impl ASHA {
             _ => return
         }
     }
+    
     async fn update_from_paired(&mut self){
         let adapter = match &self.adapter {
             Some(adapter) => adapter,
@@ -312,13 +321,24 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_)  => continue
             };
+            let psm = ((data[0] as u16) << 8) & (data[1] as u16);
+    
+            let socket_addr = SocketAddr{
+                addr: device.address(),
+                psm:  psm,
+                cid:  0,
+                ..Default::default()
+            };
+
+            let generic_socket = match Socket::new_seq_packet() {
+                Ok(res) => res,
+                Err(_) => continue
+            }; 
 
             let processor = AudioProcessor{
                 device_handle:        device,
                 read_only_properties: rop,
-                psm:                  ((data[0] as u16) << 8) & (data[1] as u16),
-                l2cap:                Socket::new_seq_packet().unwrap(),
-                seqStream:            None,
+                socket:               generic_socket.connect(socket_addr).await.unwrap(),
                 audio_status_point:   0
             };
 
@@ -330,12 +350,15 @@ impl ASHA {
             };
         }
     }
+    
     async fn update_from_one_connected(&mut self){
         self.check_side_status().await;
     }
+
     async fn update_from_two_connected(&mut self){
         self.check_side_status().await;
     }
+
     async fn check_side_status(&mut self){
         for peer in 0..self.peers_connected.len() {
             let key = self.peers_connected.keys().nth(peer).unwrap().clone();
@@ -352,18 +375,6 @@ impl ASHA {
         }
     }
     
-    pub async fn connect_l2cap(&mut self){
-        for dev in self.peers_connected {
-            let sock_addr = SocketAddr{
-                addr:      dev.1.device_handle.address().clone(),
-                psm:       dev.1.psm.clone(),
-                cid:       0,
-                ..Default::default()
-            };
-            let sock = Some(self.peers_connected[&dev.0.clone()].l2cap.connect(sock_addr).await.unwrap());
-            self.peers_connected.get_mut(&dev.0.clone()).unwrap().seqStream = sock;
-        }
-    }
     pub async fn issue_start_command(&mut self){
         for peer in &self.peers_connected {
             let service = match peer.1.device_handle.service(ASHA_ID).await {
@@ -379,16 +390,40 @@ impl ASHA {
                 Err(_) => continue
             }
         }
+        self.state = State::Streaming;
     }
 
     pub async fn send_audio_packet(&mut self, data: HashMap<DevicesConnected, Vec<u8>>) {
-        let peers = self.peers_connected.clone();
+        let peers = &self.peers_connected;
         for dev in peers {
             let meta_packet: Vec<u8> = vec![
                 data.len() as u8, data[&dev.0.clone()][0]
             ];
-            self.peers_connected[&dev.0.clone()].seqStream.as_ref().unwrap().send(&meta_packet);
-            self.peers_connected[&dev.0.clone()].seqStream.as_ref().unwrap().send(&data[&dev.0.clone()]);
+            self.peers_connected[&dev.0.clone()].socket.send(&meta_packet).await.unwrap();
+            self.peers_connected[&dev.0.clone()].socket.send(&data[&dev.0.clone()]).await.unwrap();
+        }
+    }
+
+    pub async fn get_device_statuses(&mut self){
+        for peer in &self.peers_connected {
+            let service = match peer.1.device_handle.service(ASHA_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let characteristic = match service.characteristic(ASTC_ID).await {
+                Ok(res) => res,
+                Err(_) => continue
+            };
+            let state = match characteristic.read().await {
+                Ok(res)  => res,
+                Err(_) => continue
+            };
+            match state[0] {
+                0    => (),
+                0xFF => println!("Unknown command!"),
+                0xFE => println!("Illegal params!"),
+                _    => println!("Invalid status return code")
+            }
         }
     }
 
@@ -407,5 +442,6 @@ impl ASHA {
                 Err(_) => continue
             }
         }
+        self.state = State::Idle;
     }
 }

@@ -1,30 +1,39 @@
-use std::{time::Duration, future, default, rc::{self, Rc}, sync::{Arc, Mutex}, pin::Pin, task::Context};
+use std::{time::{Duration, Instant}, future, default, rc::{self, Rc}, sync::{Arc, Mutex}, pin::Pin, task::Context, collections::HashMap};
 
 use cpal::{traits::{HostTrait, DeviceTrait}, StreamConfig, SampleRate};
 use tokio::time::sleep;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    let host = cpal::default_host();
+    let count: u8 = 0;
+    let fake_frame = [0 as u8; 160];
 
-    let dev = host.default_output_device().unwrap();
+    // let host = cpal::default_host();
+
+    // let dev = host.default_output_device().unwrap();
 
     let mut test = ASHA::ASHA::new().await;
 
     loop {
         match test.get_state().await {
-            ASHA::AdapterState::NoAdapter |
-            ASHA::AdapterState::InadequateBtVersion => {
+            ASHA::State::NoAdapter |
+            ASHA::State::InadequateBtVersion => {
                 println!("No or incompatible adapter found... exiting!");
                 break;
             },
-            ASHA::AdapterState::BluetoothOff        => {
-                sleep(Duration::from_millis(100)).await;
+            ASHA::State::BluetoothOff        => {
+                println!("Bluetooth off...");
+                sleep(Duration::from_millis(5000)).await;
                 test.update_state().await;
                 continue;
             }
-            _                                       => ()
+            _                                       => {
+                break;
+            }
         }
+    }
+
+    loop {
         match test.get_devices_connected().await {
             ASHA::DevicesConnected::NONE => {
                 sleep(Duration::from_millis(100)).await;
@@ -32,16 +41,28 @@ async fn main() {
                 continue;
             }
             _ => {
-                println!("lol");
+                break;
             }
         }
     }
 
-    // test.start_scan(1).await;
+    let connected = test.get_devices_connected().await;
+    let mut map: HashMap<ASHA::DevicesConnected, Vec<u8>> = HashMap::new();
+    map.insert(connected.clone(), Vec::new());
+    test.issue_start_command().await;
 
-    // tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-
-    // let devs = test.get_discovered();
-    // test.stop_scan();
-
+    let mut time_point: Instant;
+    while test.get_state().await == ASHA::State::Streaming {
+        time_point = Instant::now();
+        let mut data = Vec::from(fake_frame);
+        data.insert(0, count);
+        *map.get_mut(&connected).unwrap() = data;
+        test.send_audio_packet(
+            map.clone()
+        ).await;
+        test.update_devices().await;
+        while (Instant::now() - time_point) < Duration::from_millis(19) {
+            sleep(Duration::from_millis(1)).await;
+        }
+    }
 }

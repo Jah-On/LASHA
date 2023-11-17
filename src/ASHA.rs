@@ -1,8 +1,7 @@
 use std::{str::FromStr, collections::{HashSet, hash_map::RandomState, HashMap}, error::{Error, self}, default, time::Duration};
-use futures::{pin_mut, stream::SelectAll, StreamExt, select, Stream, TryFutureExt};
-use bluer::{monitor::{Pattern, data_type}, Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device, gatt::remote::{Service, CharacteristicReadRequest}, UuidExt};
-use tokio::time::sleep;
-use uuid::{uuid, Uuid};
+use futures::{pin_mut, stream::SelectAll, StreamExt, select, TryFutureExt, poll};
+use bluer::{Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device, gatt::remote::{Service, CharacteristicReadRequest, CharacteristicWriteRequest}, UuidExt, l2cap::{Socket, SocketAddr, Stream, SeqPacket}, adv::Type};
+use uuid::uuid;
 
 const test_uuid: uuid::Uuid = uuid!("00030000-78fc-48fe-8e23-433b3a1942d0");
 
@@ -20,6 +19,14 @@ const ASTC_ID: u16 = 122;
 const VOLC_ID: u16 = 125;
 const PSMC_ID: u16 = 127;
 
+const START_PACKET: [u8; 5] = [
+    0x01, 0x01, 0x03, 0x80, 0x00
+];
+
+const STOP_PACKET: [u8; 1] = [
+    0x02
+];
+
 #[derive(Clone, Debug)]
 pub enum SIDE {
     LEFT,
@@ -33,7 +40,7 @@ pub enum MODALITY {
     BINAURAL
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub enum DevicesConnected {
     NONE,
     LEFT,
@@ -138,7 +145,10 @@ impl ReadOnlyProperties {
 struct AudioProcessor {
     device_handle:        Device,
     read_only_properties: ReadOnlyProperties,
-    audio_status_point:   u8
+    psm:                  u16,
+    audio_status_point:   u8,
+    l2cap:                Socket<SeqPacket>,
+    seqStream:            Vec<SeqPacket>
 }
 
 #[derive(Clone)]
@@ -168,9 +178,7 @@ impl Default for DevicesConnected {
 pub struct ASHA {
     state:           AdapterState,
     adapter:         Option<Adapter>,
-    right:           Option<AudioProcessor>,
-    left:            Option<AudioProcessor>,
-    peers_connected: DevicesConnected,
+    peers_connected: HashMap<DevicesConnected, AudioProcessor>,
     addresses:       Vec<Address>
 }
 
@@ -201,8 +209,6 @@ impl ASHA {
                 return ASHA{
                     state:         temp_state,
                     adapter:       None,
-                    right:         None,
-                    left:          None,
                     ..Default::default()
                 };
             },
@@ -218,8 +224,6 @@ impl ASHA {
                 Ok(res) => Some(res),
                 Err(_)           => panic!("Adapter disconnected during creation?")
             },
-            right:         None,
-            left:          None,
             ..Default::default()
         };
     }
@@ -227,17 +231,22 @@ impl ASHA {
         return self.state.to_owned();
     }
     pub async fn get_devices_connected(& mut self) -> DevicesConnected {
-        return self.peers_connected.to_owned();
+        match self.peers_connected.keys().last() {
+            Some(res) => res.to_owned(),
+            None      => DevicesConnected::NONE
+        }
     }
     pub async fn update_state(&mut self){
         self.state = ASHA::get_adapter_state().await;
     }
     pub async fn update_devices(&mut self){
-        match self.peers_connected {
-            DevicesConnected::RIGHT | 
-            DevicesConnected::LEFT => self.update_from_one_connected().await,
-            DevicesConnected::BOTH => self.update_from_two_connected().await,
-            _ => self.update_from_paired().await
+        // May be updated to allow new devices during stream
+        // but omitting for now for simplicity
+        match self.peers_connected.len() {
+            0 => self.update_from_paired().await,
+            1 => self.update_from_one_connected().await,
+            2 => self.update_from_two_connected().await,
+            _ => return
         }
     }
     async fn update_from_paired(&mut self){
@@ -283,11 +292,11 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            let characteristic = match service.characteristic(ROPC_ID).await {
+            let mut characteristic = match service.characteristic(ROPC_ID).await {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            let data = match characteristic.read().await {
+            let mut data = match characteristic.read().await {
                 Ok(res) => res,
                 Err(_)  => continue
             };
@@ -295,35 +304,108 @@ impl ASHA {
                 data.try_into().unwrap()
             );
 
+            characteristic = match service.characteristic(PSMC_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            data = match characteristic.read().await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+
             let processor = AudioProcessor{
                 device_handle:        device,
                 read_only_properties: rop,
+                psm:                  ((data[0] as u16) << 8) & (data[1] as u16),
+                l2cap:                Socket::new_seq_packet().unwrap(),
+                seqStream:            None,
                 audio_status_point:   0
             };
 
             self.addresses.push(address);
             let side = processor.read_only_properties.deviceCapabilities.side.clone();
             match side {
-                SIDE::RIGHT => self.right = Some(processor),
-                SIDE::LEFT =>  self.left  = Some(processor)
-            }
-            match self.peers_connected {
-                DevicesConnected::RIGHT |
-                DevicesConnected::LEFT    => {
-                    self.peers_connected = DevicesConnected::BOTH;
-                    return;
-                }
-                DevicesConnected::NONE    => (),
-                _ => panic!("Should not add new when both are set!")
-            }
-            match side {
-                SIDE::RIGHT => self.peers_connected = DevicesConnected::RIGHT,
-                SIDE::LEFT  => self.peers_connected = DevicesConnected::LEFT
-            }
+                SIDE::RIGHT => self.peers_connected.insert(DevicesConnected::RIGHT, processor),
+                SIDE::LEFT =>  self.peers_connected.insert(DevicesConnected::LEFT, processor)
+            };
         }
     }
     async fn update_from_one_connected(&mut self){
+        self.check_side_status().await;
     }
     async fn update_from_two_connected(&mut self){
+        self.check_side_status().await;
+    }
+    async fn check_side_status(&mut self){
+        for peer in 0..self.peers_connected.len() {
+            let key = self.peers_connected.keys().nth(peer).unwrap().clone();
+            let dev =  match self.peers_connected.get(&key.clone()) {
+                Some(res) => res,
+                None => continue
+            };
+            match match dev.device_handle.is_connected().await {
+                Ok(_)  => continue,
+                Err(_) => self.peers_connected.remove(&key.clone())
+            } {
+                _ => ()
+            }
+        }
+    }
+    
+    pub async fn connect_l2cap(&mut self){
+        for dev in self.peers_connected {
+            let sock_addr = SocketAddr{
+                addr:      dev.1.device_handle.address().clone(),
+                psm:       dev.1.psm.clone(),
+                cid:       0,
+                ..Default::default()
+            };
+            let sock = Some(self.peers_connected[&dev.0.clone()].l2cap.connect(sock_addr).await.unwrap());
+            self.peers_connected.get_mut(&dev.0.clone()).unwrap().seqStream = sock;
+        }
+    }
+    pub async fn issue_start_command(&mut self){
+        for peer in &self.peers_connected {
+            let service = match peer.1.device_handle.service(ASHA_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let characteristic = match service.characteristic(ACPC_ID).await {
+                Ok(res) => res,
+                Err(_) => continue
+            };
+            match characteristic.write(START_PACKET.as_slice()).await {
+                Ok(_)  => (),
+                Err(_) => continue
+            }
+        }
+    }
+
+    pub async fn send_audio_packet(&mut self, data: HashMap<DevicesConnected, Vec<u8>>) {
+        let peers = self.peers_connected.clone();
+        for dev in peers {
+            let meta_packet: Vec<u8> = vec![
+                data.len() as u8, data[&dev.0.clone()][0]
+            ];
+            self.peers_connected[&dev.0.clone()].seqStream.as_ref().unwrap().send(&meta_packet);
+            self.peers_connected[&dev.0.clone()].seqStream.as_ref().unwrap().send(&data[&dev.0.clone()]);
+        }
+    }
+
+    pub async fn issue_stop_command(&mut self){
+        for peer in &self.peers_connected {
+            let service = match peer.1.device_handle.service(ASHA_ID).await {
+                Ok(res) => res,
+                Err(_)  => continue
+            };
+            let characteristic = match service.characteristic(ACPC_ID).await {
+                Ok(res) => res,
+                Err(_) => continue
+            };
+            match characteristic.write(STOP_PACKET.as_slice()).await {
+                Ok(_)  => (),
+                Err(_) => continue
+            }
+        }
     }
 }

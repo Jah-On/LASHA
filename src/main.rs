@@ -1,6 +1,7 @@
 use std::{time::{Duration, Instant}, future, default, rc::{self, Rc}, sync::{Arc, Mutex}, pin::Pin, task::Context, collections::HashMap};
 
-use cpal::{traits::{HostTrait, DeviceTrait}, StreamConfig, SampleRate};
+use ffmpeg_next::codec::Audio;
+use jack::{ClientOptions, AudioIn, ProcessScope, MidiIn};
 use tokio::time::sleep;
 
 #[tokio::main(flavor = "current_thread")]
@@ -8,9 +9,15 @@ async fn main() {
     let count: u8 = 0;
     let fake_frame = [0 as u8; 160];
 
-    // let host = cpal::default_host();
+    // let client = jack::Client::new("LASHA", ClientOptions::empty()).unwrap();
+    // client.0.set_buffer_size(320).unwrap();
+    // let port  = client.0.register_port("ASHA", MidiIn).unwrap();
 
-    // let dev = host.default_output_device().unwrap();
+    // let ps = unsafe {
+    //     ProcessScope::from_raw(320, client.0.raw())
+    // };
+
+    // let audio = port.as_slice(&ps);
 
     let mut test = ASHA::ASHA::new().await;
 

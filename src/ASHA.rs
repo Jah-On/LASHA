@@ -333,7 +333,13 @@ impl ASHA {
             let generic_socket = match Socket::new_seq_packet() {
                 Ok(res) => res,
                 Err(_) => continue
-            }; 
+            };
+            
+            generic_socket.set_flow_control(bluer::l2cap::FlowControl::Extended).expect("COuld not set flow control!");
+            generic_socket.set_security(bluer::l2cap::Security{
+                level:    bluer::l2cap::SecurityLevel::Medium,
+                key_size: 128
+            }).expect("Could not set security!");
 
             let processor = AudioProcessor{
                 device_handle:        device,

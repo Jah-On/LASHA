@@ -1,7 +1,7 @@
-use std::{time::{Duration, Instant}, collections::HashMap, sync::Arc};
+use std::{time::{Duration, Instant}, collections::HashMap, sync::{Arc, Mutex}, rc::Rc};
 
 use cpal::{traits::{HostTrait, DeviceTrait, StreamTrait}, StreamConfig, BufferSize, SampleRate, Sample, FromSample};
-use tokio::{time::sleep, sync::Mutex};
+use tokio::time::sleep;
 
 const SOURCE_AUDIO_CONFIG: StreamConfig = StreamConfig{
     buffer_size: BufferSize::Default,
@@ -71,19 +71,18 @@ const rh2: [i32; 4] = [2, 1, 2, 1];
 
 /*===========================================================================*/
 
-type FrameArray = Arc<Mutex<Vec<Vec<u8>>>>;
+type FrameArray = Arc<Mutex<[u8;160]>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let mut count: u8 = 0;
-    // let fake_frame = [0 as u8; 160];
 
     let host   = cpal::default_host();
     let av_dev = host.default_input_device().unwrap();
 
     println!("{}", av_dev.name().unwrap());
 
-    let frames = FrameArray::new(Mutex::new(Vec::new()));
+    let frames = FrameArray::new(Mutex::new([0;160]));
     let cloned_frames = frames.clone();
 
     let mut test = ASHA::ASHA::new().await;
@@ -132,41 +131,34 @@ async fn main() {
     stream.play().unwrap();
 
     let connected = test.get_devices_connected().await;
-    println!("Peer state is {:?}", connected);
     let mut map: HashMap<ASHA::DevicesConnected, Vec<u8>> = HashMap::new();
     map.insert(connected.clone(), Vec::new());
     test.issue_start_command().await;
-    println!("Start command issued!");
+    // println!("Start command issued!");
 
     let mut time_point: Instant;
-    let mut data: Vec<u8>;
+    let mut data: Vec<u8> = Vec::new();
+    data.resize(160, 0);
     while test.get_state().await == ASHA::State::Streaming {
         time_point = Instant::now();
-        loop {
-            sleep(Duration::from_millis(1)).await;
-            data = match frames.as_ref().try_lock() {
-                Ok(mut res) => match res.len() {
-                    0 => continue,
-                    _ => res.remove(0)
-                }
-                Err(_) => continue
-            };
-            break;
-        }
+        data = match frames.as_ref().try_lock() {
+            Ok(res) => res.to_vec(),
+            Err(_) => panic!("Could not lock mutex")
+        };
         data.insert(0, count);
-        *map.get_mut(&connected).unwrap() = data;
+        *map.get_mut(&connected).unwrap() = data.clone();
         test.send_audio_packet(
             map.clone()
         ).await;
-        println!("Audio packet sent");
-        test.get_device_statuses().await;
+        // test.get_device_statuses().await;
         match count {
-            255 => count =  0,
+            255 => count  = 0,
             _   => count += 1
         }
         test.update_devices().await;
-        while (Instant::now() - time_point) < Duration::from_millis(19) {
-            sleep(Duration::from_millis(1)).await;
+        // println!("{}", (Instant::now() - time_point).as_millis());
+        while (Instant::now() - time_point) < Duration::from_micros(19000) {
+            sleep(Duration::from_micros(200)).await;
         }
     }
 }
@@ -175,17 +167,14 @@ fn append_frame(input: &[i16], writer: &FrameArray){
     if input.len() < 320 {
         return;
     }
-    let res = pcm_to_g722(input);
+    let mut res = pcm_to_g722(input);
 
-    loop {
-        let mut guarded_vec = match writer.try_lock() {
-            Ok(res) => res,
-            Err(_) => continue
-        };
+    let mut guarded_vec = match writer.try_lock() {
+        Ok(res) => res,
+        Err(_) => panic!("Could not get lock")
+    };
 
-        guarded_vec.push(res);
-        break;
-    }
+    guarded_vec.swap_with_slice(res.as_mut_slice());
 }
 
 fn pcm_to_g722(pcm: &[i16]) -> Vec<u8> {
@@ -337,9 +326,9 @@ fn pcm_to_g722(pcm: &[i16]) -> Vec<u8> {
         code = (ihigh << 6) | ilow;
 
         /* Pack the code bits */
-        out_buffer |= code << 8;
+        out_buffer |= code;
 
-        return_buffer[g722_bytes as usize] = (out_buffer & 0xFF) as u8;
+        return_buffer[g722_bytes as usize] = out_buffer as u8;
         g722_bytes +=  1;
 
         out_buffer >>= 8;

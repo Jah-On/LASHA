@@ -20,7 +20,7 @@ const VOLC_ID: u16 = 125;
 const PSMC_ID: u16 = 127;
 
 const START_PACKET: [u8; 5] = [
-    0x01, 0x01, 0x03, 0x7F, 0x00
+    0x01, 0x01, 0x03, 0x00, 0x00
 ];
 
 const STOP_PACKET: [u8; 1] = [
@@ -365,19 +365,16 @@ impl ASHA {
     }
 
     async fn check_side_status(&mut self){
-        for peer in 0..self.peers_connected.len() {
-            let key = self.peers_connected.keys().nth(peer).unwrap().clone();
-            let dev =  match self.peers_connected.get(&key.clone()) {
-                Some(res) => res,
-                None => continue
-            };
-            match match dev.device_handle.is_connected().await {
-                Ok(_)  => continue,
-                Err(_) => self.peers_connected.remove(&key.clone())
-            } {
-                _ => ()
-            }
-        }
+        // let mut peers = self.peers_connected.values_mut();
+        // for peer in self.peers_connected.keys() {
+        //     match match peers..device_handle.is_connected().await {
+        //         Ok(res) => res,
+        //         Err(_) => continue
+        //     } {
+        //         true  => continue,
+        //         false => peers.remove(peer).unwrap()
+        //     };
+        // }
     }
     
     pub async fn issue_start_command(&mut self){
@@ -402,7 +399,7 @@ impl ASHA {
         let peers = &self.peers_connected;
         for dev in peers {
             let meta_packet: Vec<u8> = vec![
-                data.len() as u8, data[&dev.0.clone()][0]
+                data[&dev.0.clone()].len() as u8, data[&dev.0.clone()][0]
             ];
             self.peers_connected[&dev.0.clone()].socket.send(&meta_packet).await.unwrap();
             self.peers_connected[&dev.0.clone()].socket.send(&data[&dev.0.clone()]).await.unwrap();

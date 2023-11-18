@@ -1,9 +1,9 @@
-use std::{str::FromStr, collections::{HashSet, hash_map::RandomState, HashMap}, error::{Error, self}, default, time::Duration};
-use futures::{pin_mut, stream::SelectAll, StreamExt, select, TryFutureExt, poll};
-use bluer::{Session, Adapter, DiscoveryFilter, AdapterEvent, Address, Device, gatt::remote::{Service, CharacteristicReadRequest, CharacteristicWriteRequest}, UuidExt, l2cap::{Socket, SocketAddr, Stream, SeqPacket}, adv::Type};
+use std::collections::HashMap;
+use bluer::{
+    Session, Adapter, Address, Device, 
+    l2cap::{Socket, SocketAddr, SeqPacket, link_mode}
+};
 use uuid::uuid;
-
-const test_uuid: uuid::Uuid = uuid!("00030000-78fc-48fe-8e23-433b3a1942d0");
 
 pub const ASHA_UUID: uuid::Uuid = uuid!("0000FDF0-0000-1000-8000-00805F9B34FB"); // ASHA Service (0xFDF0)
 pub const ROPC_UUID: uuid::Uuid = uuid!("6333651e-c481-4a3e-9169-7c902aad37bb"); // Read Only Properties  characteristic
@@ -20,7 +20,7 @@ const VOLC_ID: u16 = 125;
 const PSMC_ID: u16 = 127;
 
 const START_PACKET: [u8; 5] = [
-    0x01, 0x01, 0x03, 0x80, 0x00
+    0x01, 0x01, 0x03, 0x7F, 0x00
 ];
 
 const STOP_PACKET: [u8; 1] = [
@@ -321,12 +321,11 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            let psm = ((data[0] as u16) << 8) & (data[1] as u16);
+            let psm = ((data[1] as u16) << 8) | (data[0] as u16);
     
             let socket_addr = SocketAddr{
                 addr: device.address(),
                 psm:  psm,
-                cid:  0,
                 ..Default::default()
             };
 
@@ -335,7 +334,7 @@ impl ASHA {
                 Err(_) => continue
             };
             
-            generic_socket.set_flow_control(bluer::l2cap::FlowControl::Extended).expect("COuld not set flow control!");
+            // generic_socket.set_flow_control(bluer::l2cap::FlowControl::Le).expect("COuld not set flow control!");
             generic_socket.set_security(bluer::l2cap::Security{
                 level:    bluer::l2cap::SecurityLevel::Medium,
                 key_size: 128

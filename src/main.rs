@@ -174,7 +174,7 @@ fn append_frame(input: &[i16], writer: &FrameArray){
     let mut res: Vec<u8> = Vec::new();
 
     unsafe {
-        g722_encode(g722_state, res.as_mut_ptr(), input.as_ptr(), input.len() as i32);
+        g722_encode(g722_state.cast(), res.as_mut_ptr(), input.as_ptr(), input.len() as i32);
     }
 
     file.write_all(&res).unwrap();

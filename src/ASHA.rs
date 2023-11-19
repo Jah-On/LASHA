@@ -335,10 +335,10 @@ impl ASHA {
             };
             
             // generic_socket.set_flow_control(bluer::l2cap::FlowControl::Le).expect("COuld not set flow control!");
-            generic_socket.set_security(bluer::l2cap::Security{
-                level:    bluer::l2cap::SecurityLevel::Medium,
-                key_size: 128
-            }).expect("Could not set security!");
+            // generic_socket.set_security(bluer::l2cap::Security{
+            //     level:    bluer::l2cap::SecurityLevel::Medium,
+            //     key_size: 128
+            // }).expect("Could not set security!");
 
             let processor = AudioProcessor{
                 device_handle:        device,

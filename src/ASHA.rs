@@ -1,8 +1,12 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap, borrow::BorrowMut, os::fd::{AsRawFd, FromRawFd},
+    io::{self, Write, BufWriter}, ptr::write_bytes
+};
 use bluer::{
     Session, Adapter, Address, Device, 
-    l2cap::{Socket, SocketAddr, SeqPacket, link_mode}
+    l2cap::{Socket, SocketAddr, SeqPacket, link_mode, Stream, Datagram}, gatt::remote::Characteristic
 };
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 use uuid::uuid;
 
 pub const ASHA_UUID: uuid::Uuid = uuid!("0000FDF0-0000-1000-8000-00805F9B34FB"); // ASHA Service (0xFDF0)
@@ -20,7 +24,7 @@ const VOLC_ID: u16 = 125;
 const PSMC_ID: u16 = 127;
 
 const START_PACKET: [u8; 5] = [
-    0x01, 0x01, 0x03, 0x00, 0x00
+    0x01, 0x01, 0x00, 0b10000000, 0x00
 ];
 
 const STOP_PACKET: [u8; 1] = [
@@ -40,7 +44,7 @@ pub enum MODALITY {
     BINAURAL
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Eq, Hash, PartialEq, Clone, Debug)]
 pub enum DevicesConnected {
     NONE,
     LEFT,
@@ -145,8 +149,8 @@ impl ReadOnlyProperties {
 struct AudioProcessor {
     device_handle:        Device,
     read_only_properties: ReadOnlyProperties,
-    audio_status_point:   u8,
-    socket:               SeqPacket
+    audio_status_point:   Characteristic,
+    socket:               Stream, 
 }
 
 // For possible feature implementation 
@@ -329,7 +333,7 @@ impl ASHA {
                 ..Default::default()
             };
 
-            let generic_socket = match Socket::new_seq_packet() {
+            let generic_socket = match Socket::new_stream() {
                 Ok(res) => res,
                 Err(_) => continue
             };
@@ -344,7 +348,7 @@ impl ASHA {
                 device_handle:        device,
                 read_only_properties: rop,
                 socket:               generic_socket.connect(socket_addr).await.unwrap(),
-                audio_status_point:   0
+                audio_status_point:   service.characteristic(ASTC_ID).await.unwrap(),
             };
 
             self.addresses.push(address);
@@ -365,14 +369,14 @@ impl ASHA {
     }
 
     async fn check_side_status(&mut self){
-        // let mut peers = self.peers_connected.values_mut();
-        // for peer in self.peers_connected.keys() {
-        //     match match peers..device_handle.is_connected().await {
+        // let keys = self.peers_connected.into_keys().cloned();
+        // for peer in keys {
+        //     match match self.peers_connected[&peer].device_handle.is_connected().await {
         //         Ok(res) => res,
         //         Err(_) => continue
         //     } {
         //         true  => continue,
-        //         false => peers.remove(peer).unwrap()
+        //         false => self.peers_connected.borrow_mut().remove(&peer).unwrap()
         //     };
         // }
     }
@@ -395,38 +399,52 @@ impl ASHA {
         self.state = State::Streaming;
     }
 
-    pub async fn send_audio_packet(&mut self, data: HashMap<DevicesConnected, Vec<u8>>) {
-        let peers = &self.peers_connected;
-        for dev in peers {
-            let meta_packet: Vec<u8> = vec![
-                data[&dev.0.clone()].len() as u8, data[&dev.0.clone()][0]
-            ];
-            self.peers_connected[&dev.0.clone()].socket.send(&meta_packet).await.unwrap();
-            self.peers_connected[&dev.0.clone()].socket.send(&data[&dev.0.clone()]).await.unwrap();
-        }
-    }
-
-    pub async fn get_device_statuses(&mut self){
+    pub async fn issue_status_command(&mut self, code: u8){
         for peer in &self.peers_connected {
             let service = match peer.1.device_handle.service(ASHA_ID).await {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            let characteristic = match service.characteristic(ASTC_ID).await {
+            let characteristic = match service.characteristic(ACPC_ID).await {
                 Ok(res) => res,
                 Err(_) => continue
             };
-            let state = match characteristic.read().await {
+            match characteristic.write(&[0x03, code, 20]).await {
+                Ok(_)  => (),
+                Err(_) => continue
+            }
+        }
+    }
+
+    pub async fn send_audio_packet(&mut self, mut data: HashMap<DevicesConnected, Vec<u8>>, seq: u8) {
+        for dev in data.borrow_mut() {
+            let len = dev.1.len();
+            let peers = self.peers_connected.borrow_mut();
+            let processor = peers.get_mut(dev.0).unwrap();
+            let socket = processor.socket.borrow_mut();
+            dev.1.insert(0, (len &  0xFF) as u8); // Count lower
+            dev.1.insert(0, (len >> 8) as u8);    // Count upper
+            dev.1.insert(0, seq);                 // Sequence
+            dev.1.insert(0, 0x00);                // Offset
+            let mut fd = unsafe { std::fs::File::from_raw_fd(socket.as_raw_fd().clone()) };
+            fd.write_all(dev.1).unwrap();
+            match socket.flush().await {
+                Ok(_) => (),
+                Err(_) => ()
+            };
+        }
+    }
+
+    pub async fn get_device_statuses(&mut self) -> HashMap<DevicesConnected, u8> {
+        let mut ret: HashMap<DevicesConnected, u8> = HashMap::new();
+        for peer in &self.peers_connected {
+            let state = match peer.1.audio_status_point.read().await {
                 Ok(res)  => res,
                 Err(_) => continue
             };
-            match state[0] {
-                0    => (),
-                0xFF => println!("Unknown command!"),
-                0xFE => println!("Illegal params!"),
-                _    => println!("Invalid status return code")
-            }
+            ret.insert(peer.0.clone(), state[0]);
         }
+        return ret;
     }
 
     pub async fn issue_stop_command(&mut self){

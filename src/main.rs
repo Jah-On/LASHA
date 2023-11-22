@@ -1,6 +1,7 @@
-use std::{time::{Duration, Instant}, collections::HashMap, sync::{Arc, Mutex}, rc::Rc, io::Write, fs::OpenOptions};
+use std::{time::{Duration, Instant}, collections::HashMap, sync::{Arc, Mutex}, borrow::BorrowMut};
 
-use cpal::{traits::{HostTrait, DeviceTrait, StreamTrait}, StreamConfig, BufferSize, SampleRate, Sample, FromSample};
+use ASHA::DevicesConnected;
+use cpal::{traits::{HostTrait, DeviceTrait, StreamTrait}, StreamConfig, BufferSize, SampleRate};
 use tokio::time::sleep;
 
 #[derive(Debug)]
@@ -44,74 +45,22 @@ extern "C" {
     fn g722_encode(s: *mut g722_encode_state_t, g722_data: *mut u8, amp: *const i16, len: i32) -> i32;
 }
 
-const SOURCE_AUDIO_CONFIG: StreamConfig = StreamConfig{
-    buffer_size: BufferSize::Default,
-    channels:    1,
-    sample_rate: SampleRate{
-        0: 16000
-    }
-};
-
-type Frame = Arc<Mutex<Vec<i16>>>;
+type Frames = Arc<Mutex<HashMap<DevicesConnected, Vec<i16>>>>;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
-    // std::fs::File::create("./test.g722").unwrap();
-    // let mut op = OpenOptions::new();
-    // op.append(true);
-
-    // let mut file = op.open("./test.g722").unwrap();
-
     let mut count: u8 = 0;
 
     let state = unsafe { g722_encode_init(std::ptr::null_mut(), 64000, 0) };
 
     let host   = cpal::default_host();
-    let av_dev = host.default_input_device().unwrap();
-
-    let frame = Frame::new(Mutex::new(Vec::new()));
-    let cloned_frame = frame.clone();
-
-    // let stream = av_dev.build_input_stream(
-    //     &SOURCE_AUDIO_CONFIG, 
-    //     move |data, _: &_| get_new_frame(data, &cloned_frame), 
-    //     move |err| {
-    //         println!("{}", err);
-    //     }, 
-    //     None
-    // ).unwrap();
-
-    // stream.play().unwrap();
-
-    let mut res: Vec<u8> = Vec::new();
-    // while file.metadata().unwrap().len() < 100000 {
-    //     let mut data = match frame.try_lock() {
-    //         Ok(res) => res,
-    //         Err(_) => {
-    //             std::thread::sleep(Duration::from_millis(1));
-    //             continue;
-    //         }
-    //     };
-
-    //     if data.len() == 0 { 
-    //         std::thread::sleep(Duration::from_millis(1));
-    //         continue; 
-    //     }
-
-    //     res.resize(data.len()/2, 0);
-
-    //     unsafe {
-    //         g722_encode(state, res.as_mut_slice().as_mut_ptr(), data.as_ptr(), data.len() as i32);
-    //     }
-
-    //     data.clear();
-
-    //     file.write(&res).unwrap();
-    // }
-    // file.flush().unwrap();
-    // stream.pause().unwrap();
+    let av_dev = host.default_output_device().unwrap();
 
     let mut test = ASHA::ASHA::new().await;
+
+    let frame = Frames::new(Mutex::new(HashMap::new()));
+    let cloned_frame = frame.clone();
+    let mut g722_data: HashMap<DevicesConnected, [u8; 160]> = HashMap::new();
 
     loop {
         match test.get_state().await {
@@ -132,21 +81,51 @@ async fn main() {
         }
     }
 
+    let devices_connected = test.get_devices_connected().await;
     loop {
-        match test.get_devices_connected().await {
+        match devices_connected {
             ASHA::DevicesConnected::NONE => {
                 sleep(Duration::from_millis(100)).await;
                 test.update_devices().await;
                 continue;
             }
-            _ => {
+            ASHA::DevicesConnected::RIGHT |
+            ASHA::DevicesConnected::LEFT  => {
+                frame.try_lock().unwrap().insert(
+                    devices_connected.clone(), 
+                    Vec::new()
+                );
+                g722_data.insert(devices_connected, [0 as u8; 160]);
+                break;
+            }
+            ASHA::DevicesConnected::BOTH  => {
+                frame.try_lock().unwrap().insert(
+                    ASHA::DevicesConnected::LEFT, 
+                    Vec::new()
+                );
+                frame.try_lock().unwrap().insert(
+                    ASHA::DevicesConnected::RIGHT, 
+                    Vec::new()
+                );
+                g722_data.insert(
+                    ASHA::DevicesConnected::LEFT, 
+                    [0 as u8; 160]
+                );
+                g722_data.insert(
+                    ASHA::DevicesConnected::RIGHT, 
+                    [0 as u8; 160]
+                ); // May need to swap order
                 break;
             }
         }
     }
 
     let stream = av_dev.build_input_stream(
-        &SOURCE_AUDIO_CONFIG, 
+        &StreamConfig{
+            buffer_size: BufferSize::Default,
+            channels:    g722_data.len().max(2) as u16,
+            sample_rate: SampleRate{ 0: 16000 }
+        }, 
         move |data, _: &_| get_new_frame(data, &cloned_frame), 
         move |err| {
             println!("{}", err);
@@ -161,37 +140,24 @@ async fn main() {
     map.insert(connected.clone(), Vec::new());
 
     let mut time_point: Instant;
-    let mut g722_data: [u8; 160] = [0; 160];
 
-    // loop {
-    //     let mut data = match frame.try_lock() {
-    //         Ok(res) => res,
-    //         Err(_) => {
-    //             std::thread::sleep(Duration::from_millis(1));
-    //             continue;
-    //         }
-    //     };
-
-    //     if data.len() < 320 { 
-    //         std::thread::sleep(Duration::from_millis(1));
-    //         continue;
-    //     }
-    //     unsafe {
-    //         g722_encode(state, g722_data.as_mut_ptr(), data.drain(0..320).as_slice().as_ptr(), 320);
-    //     }
-    //     *map.get_mut(&connected).unwrap() = g722_data.to_vec();
-    //     map.get_mut(&connected).unwrap().insert(0, count);
-    //     test.send_audio_packet(
-    //         map.clone(), count
-    //     ).await;
-    //     break;
-    // }
-    // count += 1;
     test.issue_status_command(0).await;
+
+    for res in test.get_device_statuses().await {
+        match res.1 {
+            0 => println!("OK!"),
+            _ => panic!("Bad state {}", res.1)
+        }
+    }
 
     test.issue_start_command().await;
 
-    test.get_device_statuses().await;
+    for res in test.get_device_statuses().await {
+        match res.1 {
+            0 => println!("OK!"),
+            _ => panic!("Bad state {}", res.1)
+        }
+    }
 
     while test.get_state().await == ASHA::State::Streaming {
         time_point = Instant::now();
@@ -203,21 +169,37 @@ async fn main() {
             }
         };
 
-        if data.len() < 320 { 
+        if data.values().nth(0).unwrap().len() < 320 { 
             std::thread::sleep(Duration::from_millis(1));
             continue;
         }
 
         // test.issue_status_command(2).await;
 
-        unsafe {
-            g722_encode(state, g722_data.as_mut_ptr(), data.drain(0..320).as_slice().as_ptr(), 320);
+        for side in g722_data.borrow_mut() {
+            unsafe {
+                g722_encode(
+                    state, 
+                    side.1.as_mut_ptr(), 
+                    data.get_mut(side.0).unwrap().drain(
+                        0..320
+                    ).as_slice().as_ptr(), 
+                    320
+                );
+            }
+            *map.get_mut(&side.0).unwrap() = side.1.to_vec();
         }
-        *map.get_mut(&connected).unwrap() = g722_data.to_vec();
+        
         test.send_audio_packet(
             map.clone(), count
         ).await;
-        // test.get_device_statuses().await;
+        for res in test.get_device_statuses().await {
+            match res.1 {
+                0 => println!("OK!"),
+                _ => panic!("Bad state {}", res.1)
+            }
+        }
+        // test.issue_status_command(2).await;
         match count {
             255 => count  = 0,
             _   => count += 1
@@ -226,11 +208,16 @@ async fn main() {
         while (Instant::now() - time_point) < Duration::from_micros(19000) {
             sleep(Duration::from_micros(200)).await;
         }
-        println!("{}", (Instant::now() - time_point).as_millis());
+        // println!("{}", (Instant::now() - time_point).as_millis());
+        // test.issue_stop_command().await;
+        // test.close_l2cap().await;
+
+        // break;
     }
 }
 
-fn get_new_frame(input: &[i16], frame: &Frame){
+fn get_new_frame(input: &[i16], frame: &Frames){
+    let mut start = 0;
     loop {
         let mut res = match frame.try_lock() {
             Ok(res) => res,
@@ -239,7 +226,13 @@ fn get_new_frame(input: &[i16], frame: &Frame){
                 continue;
             }
         };
-        res.append(&mut input.to_vec());
+        let channels = res.len();
+        for side in res.iter_mut() {
+            side.1.append(
+                input[start..(input.len()/channels)+start
+            ].as_ref().to_vec().as_mut());
+            start += input.len()/channels;
+        }
         return;
     }
 }

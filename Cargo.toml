@@ -13,6 +13,7 @@ cc          = "1.0"
 
 [dependencies]
 bluer       = {version = "0.16.1", features = ["full"]}
+byteorder   = "1.5.0"
 cpal        = "0.15.2"
 futures     = "0.3.29"
 tokio       = "1.33.0"

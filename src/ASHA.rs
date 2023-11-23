@@ -1,13 +1,11 @@
 use std::{
-    collections::HashMap, borrow::BorrowMut, os::{fd::{AsRawFd, FromRawFd}, unix::fs::FileExt},
-    io::{self, Write, BufWriter, Read}, ptr::write_bytes, fs::read, fmt::{LowerHex, UpperHex}, process::exit
+    collections::HashMap, borrow::BorrowMut,
 };
 use bluer::{
     Session, Adapter, Address, Device, 
-    l2cap::{Socket, SocketAddr, SeqPacket, link_mode, Stream, Datagram}, gatt::remote::Characteristic
+    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::Characteristic
 };
-use byteorder::LittleEndian;
-use tokio::io::{AsyncWrite, AsyncWriteExt, AsyncReadExt};
+use tokio::io::AsyncWriteExt;
 use uuid::uuid;
 
 pub const ASHA_UUID: uuid::Uuid = uuid!("0000FDF0-0000-1000-8000-00805F9B34FB"); // ASHA Service (0xFDF0)
@@ -423,27 +421,11 @@ impl ASHA {
             let peers = self.peers_connected.borrow_mut();
             let processor = peers.get_mut(dev.0).unwrap();
             let socket = processor.socket.borrow_mut();
-            // dev.1.insert(0, (len &  0xFF) as u8); // Count lower
-            // dev.1.insert(0, (len >> 8) as u8);    // Count upper
-            // dev.1.insert(0, seq);                 // Sequence
-            // dev.1.insert(0, len as u8);           // Sequence
-            // println!("{:?}", dev.1);
-            // dev.1.reverse();
-            // for index in 0..dev.1.len(){
-            //     dev.1[index] = dev.1[index].to_le();
-            // }
+            dev.1.insert(0, seq);                 // Sequence
+            dev.1.insert(0, 0);                   // Offset
+            dev.1.insert(0, len as u8);           // Length
             socket.write_all(&dev.1).await.unwrap();
-            // let mut res = [0 as u8, 160];
-            // match socket.read(res.as_mut()).await {
-            //     Ok(_) => (),
-            //     Err(_) => return 
-            // };
-            // socket.read_exact(res.as_mut_slice()).unwrap();
-            // socket.flush().await.unwrap();
-            // let file = unsafe { std::fs::File::from_raw_fd(socket.as_raw_fd()) };
-            // socket.read_exact(res.as_mut_slice()).await.unwrap();
-            // println!("data: {:?}", res);
-            // println!("FD size: {}", file.metadata().unwrap().len());
+            socket.flush().await.unwrap();
         }
     }
 

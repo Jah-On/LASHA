@@ -417,7 +417,7 @@ impl ASHA {
 
     pub async fn send_audio_packet(&mut self, mut data: HashMap<DevicesConnected, Vec<u8>>, seq: u8) {
         for dev in data.borrow_mut() {
-            let len = dev.1.len();
+            let len = dev.1.len() + 1;
             let peers = self.peers_connected.borrow_mut();
             let processor = peers.get_mut(dev.0).unwrap();
             let socket = processor.socket.borrow_mut();

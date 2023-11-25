@@ -3,7 +3,7 @@ use std::{
 };
 use bluer::{
     Session, Adapter, Address, Device, 
-    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::Characteristic
+    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::Characteristic, DeviceEvent
 };
 use tokio::io::AsyncWriteExt;
 use uuid::uuid;
@@ -304,6 +304,8 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_)  => continue
             };
+            println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
+            println!("Service data: {:?}", device.service_data().await.unwrap());
             let mut characteristic = match service.characteristic(ROPC_ID).await {
                 Ok(res) => res,
                 Err(_)  => continue
@@ -336,7 +338,7 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_) => continue
             };
-            
+
             // generic_socket.set_flow_control(bluer::l2cap::FlowControl::Le).expect("COuld not set flow control!");
             // generic_socket.set_security(bluer::l2cap::Security{
             //     level:    bluer::l2cap::SecurityLevel::Medium,
@@ -349,6 +351,15 @@ impl ASHA {
                 socket:               generic_socket.connect(socket_addr).await.unwrap(),
                 audio_status_point:   service.characteristic(ASTC_ID).await.unwrap(),
             };
+
+            // loop {
+            //     match match device.events().await {
+            //         Ok(res) => res,
+            //         Err(_) => continue
+            //     } {
+            //         DeviceEvent::PropertyChanged(_) => break
+            //     }
+            // }
 
             self.addresses.push(address);
             let side = processor.read_only_properties.deviceCapabilities.side.clone();

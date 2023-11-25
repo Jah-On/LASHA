@@ -285,6 +285,19 @@ impl ASHA {
                 }
                 Err(_) => continue
             }
+            match match device.is_services_resolved().await {
+                Ok(bool) => bool,
+                Err(_) => {
+                    println!("Could not get service resolution state");
+                    continue;
+                }
+            } {
+                true  => (),
+                false => {
+                    println!("Service(s) not resolved, skipping...");
+                    continue;
+                }
+            }
             match match match device.uuids().await {
                 Ok(res) => res,
                 Err(_)  => {
@@ -304,8 +317,8 @@ impl ASHA {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
-            println!("Service data: {:?}", device.service_data().await.unwrap());
+            // println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
+            // println!("Service data: {:?}", device.service_data().await.unwrap());
             let mut characteristic = match service.characteristic(ROPC_ID).await {
                 Ok(res) => res,
                 Err(_)  => continue

@@ -331,6 +331,7 @@ impl ASHA {
                     continue;
                 }
             };
+            println!("Cached value: {:?}", characteristic.cached_value().await.unwrap());
             let mut data = match characteristic.read().await {
                 Ok(res) => res,
                 Err(_)  => {

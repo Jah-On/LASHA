@@ -319,13 +319,24 @@ impl ASHA {
             };
             // println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
             // println!("Service data: {:?}", device.service_data().await.unwrap());
+
+            for chr in service.characteristics().await.unwrap() {
+                println!("Characteristic {:?} with ID {}", chr.uuid().await, chr.id());
+            }
+
             let mut characteristic = match service.characteristic(ROPC_ID).await {
                 Ok(res) => res,
-                Err(_)  => continue
+                Err(_)  => {
+                    println!("Could not find characteristic!");
+                    continue;
+                }
             };
             let mut data = match characteristic.read().await {
                 Ok(res) => res,
-                Err(_)  => continue
+                Err(_)  => {
+                    println!("Could not read characteristic!");
+                    continue;
+                }
             };
             let rop = ReadOnlyProperties::new(
                 data.try_into().unwrap()

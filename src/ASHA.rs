@@ -3,7 +3,7 @@ use std::{
 };
 use bluer::{
     Session, Adapter, Address, Device, 
-    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::Characteristic, DeviceEvent
+    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::{Characteristic, Service}, DeviceEvent
 };
 use tokio::io::AsyncWriteExt;
 use uuid::uuid;
@@ -15,12 +15,12 @@ pub const ASTC_UUID: uuid::Uuid = uuid!("38663f1a-e711-4cac-b641-326b56404837");
 pub const VOLC_UUID: uuid::Uuid = uuid!("00e4ca9e-ab14-41e4-8823-f9e70c7e91df"); // Volume                characteristic
 pub const PSMC_UUID: uuid::Uuid = uuid!("2d410339-82b6-42aa-b34e-e2e01df8cc1a"); // LE Pulse Module Sense characteristic
 
-const ASHA_ID: u16 = 117;
-const ROPC_ID: u16 = 118;
-const ACPC_ID: u16 = 120;
-const ASTC_ID: u16 = 122;
-const VOLC_ID: u16 = 125;
-const PSMC_ID: u16 = 127;
+// const ASHA_ID: u16 = 117;
+// const ROPC_ID: u16 = 118;
+// const ACPC_ID: u16 = 120;
+// const ASTC_ID: u16 = 122;
+// const VOLC_ID: u16 = 125;
+// const PSMC_ID: u16 = 127;
 
 const START_PACKET: [u8; 5] = [
     0x01, 0x01, 0x00, 0b10000000, 0x00
@@ -146,9 +146,12 @@ impl ReadOnlyProperties {
 
 // #[derive(Clone)]
 struct AudioProcessor {
-    device_handle:        Device,
+    //device_handle:        Device,
+    service:              Service,
     read_only_properties: ReadOnlyProperties,
     audio_status_point:   Characteristic,
+    audio_control_point:  Characteristic,
+    volume:               Characteristic,
     socket:               Stream, 
 }
 
@@ -298,39 +301,46 @@ impl ASHA {
                     continue;
                 }
             }
-            match match match device.uuids().await {
+            let mut service_map = HashMap::new();
+            let services = match device.services().await {
                 Ok(res) => res,
-                Err(_)  => {
+                Err(e)  => {
+                    println!("Error getting service list: {}", e);
                     continue;
                 }
-            } {
-                Some(res) => res,
-                None    => {
-                    continue;
-                }
-            }.contains(&ASHA_UUID) {
-                true  => (),
-                false => continue
             };
-
-            let service = match device.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            // println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
-            // println!("Service data: {:?}", device.service_data().await.unwrap());
-
-            for chr in service.characteristics().await.unwrap() {
-                println!("Characteristic {:?} with ID {}", chr.uuid().await, chr.id());
+            for serv in services {
+                let u = match serv.uuid().await {
+                    Ok(res) => res,
+                    Err(_) => continue
+                };
+                service_map.insert(u, serv);
             }
-
-            let mut characteristic = match service.characteristic(ROPC_ID).await {
+            if !service_map.contains_key(&ASHA_UUID) {
+                println!("ASHA service UUID not found");
+                continue;
+            }
+            let service = &service_map[&ASHA_UUID];
+            let mut char_map = HashMap::new();
+            let characteristics = match service.characteristics().await {
                 Ok(res) => res,
-                Err(_)  => {
-                    println!("Could not find characteristic!");
-                    continue;
-                }
+                Err(_) => continue
             };
+            for c in characteristics {
+                let u = match c.uuid().await {
+                    Ok(res) => res,
+                    Err(_) => continue
+                };
+                char_map.insert(u, c);
+            }
+            if !char_map.contains_key(&ROPC_UUID) ||
+               !char_map.contains_key(&PSMC_UUID) ||
+               !char_map.contains_key(&ACPC_UUID) ||
+               !char_map.contains_key(&ASTC_UUID) ||
+               !char_map.contains_key(&VOLC_UUID) {
+                continue;
+               }
+            let mut characteristic = &char_map[&ROPC_UUID];
             println!("Cached value: {:?}", characteristic.cached_value().await.unwrap());
             let mut data = match characteristic.read().await {
                 Ok(res) => res,
@@ -343,10 +353,7 @@ impl ASHA {
                 data.try_into().unwrap()
             );
 
-            characteristic = match service.characteristic(PSMC_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
+            characteristic = &char_map[&PSMC_UUID];
             data = match characteristic.read().await {
                 Ok(res) => res,
                 Err(_)  => continue
@@ -371,10 +378,14 @@ impl ASHA {
             // }).expect("Could not set security!");
 
             let processor = AudioProcessor{
-                device_handle:        device,
+                
+                //device_handle:        device,
+                service:              service_map.remove(&ASHA_UUID).unwrap(),
                 read_only_properties: rop,
                 socket:               generic_socket.connect(socket_addr).await.unwrap(),
-                audio_status_point:   service.characteristic(ASTC_ID).await.unwrap(),
+                audio_control_point:  char_map.remove(&ACPC_UUID).unwrap(),
+                audio_status_point:   char_map.remove(&ASTC_UUID).unwrap(),
+                volume:               char_map.remove(&VOLC_UUID).unwrap()
             };
 
             // loop {
@@ -418,14 +429,15 @@ impl ASHA {
     
     pub async fn issue_start_command(&mut self){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
+            // let service = match peer.1.device_handle.service(ASHA_ID).await {
+            //     Ok(res) => res,
+            //     Err(_)  => continue
+            // };
+            // let characteristic = match service.characteristic(ACPC_ID).await {
+            //     Ok(res) => res,
+            //     Err(_) => continue
+            // };
+            let characteristic = &peer.1.audio_control_point;
             match characteristic.write(START_PACKET.as_slice()).await {
                 Ok(_)  => (),
                 Err(_) => continue
@@ -436,14 +448,15 @@ impl ASHA {
 
     pub async fn issue_status_command(&mut self, code: u8){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
+            // let service = match peer.1.device_handle.service(ASHA_ID).await {
+            //     Ok(res) => res,
+            //     Err(_)  => continue
+            // };
+            // let characteristic = match service.characteristic(ACPC_ID).await {
+            //     Ok(res) => res,
+            //     Err(_) => continue
+            // };
+            let characteristic = &peer.1.audio_status_point;
             match characteristic.write(&[0x03, code, 20]).await {
                 Ok(_)  => (),
                 Err(_) => continue
@@ -479,14 +492,15 @@ impl ASHA {
 
     pub async fn issue_stop_command(&mut self){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
+            // let service = match peer.1.device_handle.service(ASHA_ID).await {
+            //     Ok(res) => res,
+            //     Err(_)  => continue
+            // };
+            // let characteristic = match service.characteristic(ACPC_ID).await {
+            //     Ok(res) => res,
+            //     Err(_) => continue
+            // };
+            let characteristic = &peer.1.audio_control_point;
             match characteristic.write(STOP_PACKET.as_slice()).await {
                 Ok(_)  => (),
                 Err(_) => continue

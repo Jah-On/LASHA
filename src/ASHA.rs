@@ -3,8 +3,9 @@ use std::{
 };
 use bluer::{
     Session, Adapter, Address, Device, 
-    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::Characteristic, DeviceEvent
+    l2cap::{Socket, SocketAddr, Stream}, gatt::remote::{Characteristic, Service}, DeviceEvent
 };
+use futures::TryFutureExt;
 use tokio::io::AsyncWriteExt;
 use uuid::uuid;
 
@@ -14,13 +15,6 @@ pub const ACPC_UUID: uuid::Uuid = uuid!("f0d4de7e-4a88-476c-9d9f-1937b0996cc0");
 pub const ASTC_UUID: uuid::Uuid = uuid!("38663f1a-e711-4cac-b641-326b56404837"); // Audio Status          characteristic
 pub const VOLC_UUID: uuid::Uuid = uuid!("00e4ca9e-ab14-41e4-8823-f9e70c7e91df"); // Volume                characteristic
 pub const PSMC_UUID: uuid::Uuid = uuid!("2d410339-82b6-42aa-b34e-e2e01df8cc1a"); // LE Pulse Module Sense characteristic
-
-const ASHA_ID: u16 = 117;
-const ROPC_ID: u16 = 118;
-const ACPC_ID: u16 = 120;
-const ASTC_ID: u16 = 122;
-const VOLC_ID: u16 = 125;
-const PSMC_ID: u16 = 127;
 
 const START_PACKET: [u8; 5] = [
     0x01, 0x01, 0x00, 0b10000000, 0x00
@@ -147,8 +141,8 @@ impl ReadOnlyProperties {
 // #[derive(Clone)]
 struct AudioProcessor {
     device_handle:        Device,
+    gatt:                 GATT,
     read_only_properties: ReadOnlyProperties,
-    audio_status_point:   Characteristic,
     socket:               Stream, 
 }
 
@@ -175,6 +169,15 @@ impl Default for State {
 
 impl Default for DevicesConnected {
     fn default() -> Self { DevicesConnected::NONE }
+}
+
+#[derive(Clone, Debug)]
+pub struct GATT {
+    ROPC: Characteristic,
+    ACPC: Characteristic,
+    ASTC: Characteristic,
+    VOLC: Characteristic,
+    PSMC: Characteristic,
 }
 
 #[derive(Default)]
@@ -270,7 +273,15 @@ impl ASHA {
             Ok(res) => res,
             Err(_)      => return
         };
-        for address in addresses {
+
+        let mut service: Option<Service>     = None;
+        let mut ROPC: Option<Characteristic> = None;
+        let mut ACPC: Option<Characteristic> = None;
+        let mut ASTC: Option<Characteristic> = None;
+        let mut VOLC: Option<Characteristic> = None;
+        let mut PSMC: Option<Characteristic> = None;
+        let mut GATT: GATT;
+        'device_loop: for address in addresses {
             if self.addresses.contains(&address){
                 continue;
             }
@@ -313,26 +324,57 @@ impl ASHA {
                 false => continue
             };
 
-            let service = match device.service(ASHA_ID).await {
+
+            let services = match device.services().await {
                 Ok(res) => res,
                 Err(_)  => continue
             };
-            // println!("Advertisement data: {:?}", device.advertising_data().await.unwrap());
-            // println!("Service data: {:?}", device.service_data().await.unwrap());
-
-            for chr in service.characteristics().await.unwrap() {
-                println!("Characteristic {:?} with ID {}", chr.uuid().await, chr.id());
+            
+            for serv in services {
+                match match serv.uuid().await {
+                    Ok(res) => res,
+                    Err(_) => continue
+                } {
+                    ASHA_UUID => service = Some(serv),
+                    _         => continue
+                }
             }
 
-            let mut characteristic = match service.characteristic(ROPC_ID).await {
+            match service.clone() {
+                Some(_) => (),
+                None    => continue
+            }
+
+            let characteristics = match service.as_ref().unwrap().characteristics().await {
                 Ok(res) => res,
-                Err(_)  => {
-                    println!("Could not find characteristic!");
-                    continue;
-                }
+                Err(_) => continue
             };
-            println!("Cached value: {:?}", characteristic.cached_value().await.unwrap());
-            let mut data = match characteristic.read().await {
+            for chr in characteristics {
+                match match chr.uuid().await {
+                    Ok(res) => res,
+                    Err(_) => continue 'device_loop
+                } {
+                    ROPC_UUID => ROPC = Some(chr.to_owned()),
+                    ACPC_UUID => ACPC = Some(chr.to_owned()),
+                    ASTC_UUID => ASTC = Some(chr.to_owned()),
+                    VOLC_UUID => VOLC = Some(chr.to_owned()),
+                    PSMC_UUID => PSMC = Some(chr.to_owned()),
+                    _         => {
+                        println!("Unknown characteristic found in ASHA service! Returning...");
+                        return;
+                    } 
+                }
+            }
+
+            GATT = GATT{
+                ACPC: ACPC.to_owned().unwrap(),
+                ASTC: ASTC.to_owned().unwrap(),
+                PSMC: PSMC.to_owned().unwrap(),
+                ROPC: ROPC.to_owned().unwrap(),
+                VOLC: VOLC.to_owned().unwrap(),
+            };
+
+            let mut data = match GATT.ROPC.read().await {
                 Ok(res) => res,
                 Err(_)  => {
                     println!("Could not read characteristic!");
@@ -343,11 +385,7 @@ impl ASHA {
                 data.try_into().unwrap()
             );
 
-            characteristic = match service.characteristic(PSMC_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            data = match characteristic.read().await {
+            data = match GATT.PSMC.read().await {
                 Ok(res) => res,
                 Err(_)  => continue
             };
@@ -372,9 +410,9 @@ impl ASHA {
 
             let processor = AudioProcessor{
                 device_handle:        device,
+                gatt:                 GATT,
                 read_only_properties: rop,
                 socket:               generic_socket.connect(socket_addr).await.unwrap(),
-                audio_status_point:   service.characteristic(ASTC_ID).await.unwrap(),
             };
 
             // loop {
@@ -418,15 +456,7 @@ impl ASHA {
     
     pub async fn issue_start_command(&mut self){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
-            match characteristic.write(START_PACKET.as_slice()).await {
+            match peer.1.gatt.ACPC.write(START_PACKET.as_slice()).await {
                 Ok(_)  => (),
                 Err(_) => continue
             }
@@ -436,15 +466,7 @@ impl ASHA {
 
     pub async fn issue_status_command(&mut self, code: u8){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
-            match characteristic.write(&[0x03, code, 20]).await {
+            match peer.1.gatt.ACPC.write(&[0x03, code, 20]).await {
                 Ok(_)  => (),
                 Err(_) => continue
             }
@@ -468,7 +490,7 @@ impl ASHA {
     pub async fn get_device_statuses(&mut self) -> HashMap<DevicesConnected, u8> {
         let mut ret: HashMap<DevicesConnected, u8> = HashMap::new();
         for peer in &self.peers_connected {
-            let state = match peer.1.audio_status_point.read().await {
+            let state = match peer.1.gatt.ASTC.read().await {
                 Ok(res)  => res,
                 Err(_) => continue
             };
@@ -479,15 +501,7 @@ impl ASHA {
 
     pub async fn issue_stop_command(&mut self){
         for peer in &self.peers_connected {
-            let service = match peer.1.device_handle.service(ASHA_ID).await {
-                Ok(res) => res,
-                Err(_)  => continue
-            };
-            let characteristic = match service.characteristic(ACPC_ID).await {
-                Ok(res) => res,
-                Err(_) => continue
-            };
-            match characteristic.write(STOP_PACKET.as_slice()).await {
+            match peer.1.gatt.ACPC.write(STOP_PACKET.as_slice()).await {
                 Ok(_)  => (),
                 Err(_) => continue
             }
